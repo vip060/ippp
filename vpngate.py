@@ -14,9 +14,11 @@ VPN Gate SSTP 节点检测流水线 (精简版)
 import base64
 import csv
 import io
+import ipaddress
 import json
 import os
 import re
+import socket
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -81,16 +83,37 @@ COUNTRY_ZH = {
 }
 
 # 静态优选域名池
+# ---------------------------------------------------------------------------
+# 2026-10-12 在中国电信(河北邢台)实测的排序（SNI=worker 域名，直连测总耗时）：
+#   第一档 172.64.229.10 → CF 东京 NRT，总耗时 184~211ms（最快）
+#   第二档 172.64.229.17x / 104.18.x → NRT / 新加坡 SIN，总耗时 316~427ms
+# 已剔除 www.bilibili.com —— 它不是 Cloudflare 域名（解析到国内 106.118.30.x），
+# 拿来当入口 100% 失败，白白占掉 1/20 的轮转槽位。
+# 顺序 = 优先级，靠前的入口会被分配给排名靠前的节点。
+# ---------------------------------------------------------------------------
 EDGE_HOSTS = [
     h.strip()
     for h in os.environ.get(
         "EDGE_HOSTS",
-        "saas.sin.fan:443,cdn.204910.best:443,www.mfyx.cn:443,p.etime.vip:443,cdn.ctn32.us.kg:443,cf.877774.xyz:443,spring.io:443,"
-        "cf.nyanya.moe:443,www.sloomb.com:443,op.chinwa.eu.cc:443,www.leics.police.uk:443,securecircle.com:443,www.shopify.com:443,"
-        "www.carousell.sg:443,www.dbs.com.sg:443,openai.com:443,linear.app:443,www.bilibili.com:443,uspto.gov:443,www.vmware.com:443",
+        # ---- 第一档：实测最快 ----
+        "www.mfyx.cn:443,cdn.ctn32.us.kg:443,cdn.204910.best:443,saas.sin.fan:443,"
+        # ---- 第二档：可用但慢一档 ----
+        "cf.nyanya.moe:443,cf.877774.xyz:443,p.etime.vip:443,"
+        "uspto.gov:443,securecircle.com:443,openai.com:443,spring.io:443,op.chinwa.eu.cc:443,"
+        "www.leics.police.uk:443,linear.app:443,www.shopify.com:443,www.carousell.sg:443,"
+        "www.dbs.com.sg:443,www.vmware.com:443,www.sloomb.com:443",
     ).split(",")
     if h.strip()
 ]
+
+# Cloudflare 官方 IPv4 段（用于剔除「伪优选域名」）
+CF_NETWORKS = [
+    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+    "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+    "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+    "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+]
+_CF_NET_OBJS = [ipaddress.ip_network(n) for n in CF_NETWORKS]
 
 # 优选 API 地址配置 (支持逗号分隔多个，可配置在 GitHub Action Secret / Env 中)
 OPTIMAL_API = os.environ.get("OPTIMAL_API", "https://cf.090227.xyz/ct?ips=6&port=443")
@@ -250,9 +273,65 @@ def fetch_optimal_api_endpoints(api_urls_str):
             log("OPTIMAL API", f"拉取优选 API 失败 ({url}): {e}")
     return endpoints
 
+def resolve_ipv4(host):
+    """取域名/IP 的首个 IPv4，失败返回 None"""
+    h = host.split(":")[0].strip()
+    try:
+        return socket.gethostbyname(h)
+    except Exception:
+        return None
+
+
+def is_cloudflare_ip(ip):
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(a in net for net in _CF_NET_OBJS)
+
+
+def probe_edge_host(host):
+    """
+    判定一个入口是否真的是 Cloudflare 前置。
+    正向判据：请求 https://<host>/cdn-cgi/trace 能拿到 colo= / fl= 字段。
+    回退判据：解析出的 IP 落在 Cloudflare 官方段内。
+    目的：把 www.bilibili.com 这类「根本不是 CF 域名」的伪入口清出去。
+    """
+    h = host.split(":")[0].strip()
+    try:
+        r = requests.get(f"https://{h}/cdn-cgi/trace", timeout=8,
+                         headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=False)
+        body = r.text[:400]
+        if "colo=" in body and "fl=" in body:
+            return True, "CF trace"
+    except Exception:
+        pass
+    ip = resolve_ipv4(host)
+    if ip and is_cloudflare_ip(ip):
+        return True, f"CF 段 {ip}"
+    return False, (ip or "DNS 失败")
+
+
+def validate_edge_hosts(hosts):
+    """
+    剔除「伪优选域名」。多线程探测，失败即丢弃（宁可少几个入口，也不要一个必死的入口）。
+    """
+    kept, dropped = [], []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futs = {pool.submit(probe_edge_host, h): h for h in hosts}
+        for fut in futs:
+            h = futs[fut]
+            ok, note = fut.result()
+            (kept if ok else dropped).append((h, note) if not ok else h)
+    if dropped:
+        log("EDGE POOL", "剔除非 Cloudflare 入口 %d 个: %s"
+            % (len(dropped), ", ".join(f"{h}({n})" for h, n in dropped)))
+    return kept
+
+
 def get_combined_edge_hosts():
     """
-    合并静态优选域名与优选 API 端点
+    合并静态优选域名与优选 API 端点，并做可用性校验
     """
     # 1. 优先读取 HOSTS_ENTRY 或 EDGE_HOSTS
     _entry = os.environ.get("HOSTS_ENTRY", "").strip()
@@ -261,14 +340,15 @@ def get_combined_edge_hosts():
     # 2. 拉取优选 API 端点
     api_hosts = fetch_optimal_api_endpoints(OPTIMAL_API)
 
-    # 3. 合并与去重 (保留原始列表顺序)
-    combined = []
+    # 3. 合并 (保留原始列表顺序) 后校验 + 按落地 IP 去重
+    raw = []
     seen = set()
     for h in static_hosts + api_hosts:
         if h and h not in seen:
             seen.add(h)
-            combined.append(h)
+            raw.append(h)
 
+    combined = validate_edge_hosts(raw)
     log("EDGE POOL", f"汇总入口地址池: 静态域名 {len(static_hosts)} 个, API 获取 {len(api_hosts)} 个, 合并有效入口共 {len(combined)} 个")
     return combined if combined else EDGE_HOSTS
 
