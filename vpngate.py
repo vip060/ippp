@@ -677,9 +677,8 @@ def build_nodes_text(data, edge_hosts):
         )
         for i, n in enumerate(nodes_sorted, 1):
             entry = edge_hosts[idx % len(edge_hosts)]
-            suffix = f"-更新{ts}" if idx == 0 and ts else ""
             idx += 1
-            lines.append(f"{entry}#{zh}-住宅-{i:02d}{suffix}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+            lines.append(f"{entry}#{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
     return "\n".join(lines) + "\n"
 
 
