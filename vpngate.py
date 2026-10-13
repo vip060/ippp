@@ -44,6 +44,7 @@ VPNGATE_MIRROR = os.environ.get(
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
 WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://ip.v77580.fun/check?sstp=vpn:vpn@")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "2580")
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
@@ -412,10 +413,17 @@ def check_one(node, session):
     out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     out["exit"] = None
     out["residential"] = "unknown"
+    
+    # 构造请求头，带上后台鉴权 Token
+    headers = {"User-Agent": "Mozilla/5.0 (gate-checker)"}
+    if ADMIN_PASSWORD:
+        headers["Authorization"] = f"Bearer {ADMIN_PASSWORD}"
+
     try:
-        r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
+        r = session.get(url, timeout=CHECK_TIMEOUT, headers=headers)
         if r.status_code != 200:
-            out["error"] = f"HTTP {r.status_code}"
+            # 记录具体的错误状态码，方便排查
+            out["error"] = f"HTTP {r.status_code}: {r.text[:200]}"
             out["worker_error"] = True
             return out
         j = r.json()
