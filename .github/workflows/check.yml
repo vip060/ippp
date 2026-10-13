@@ -6,7 +6,7 @@ name: VPN Gate Node Check
 #    改为每 30 分钟，这是提升存活率最关键的一处。
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "0 */6 * * *"
   workflow_dispatch:
 
 permissions:
