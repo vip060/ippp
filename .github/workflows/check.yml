@@ -42,8 +42,8 @@ jobs:
           #      edgetunnel  判可用 27/40 = 68%  ← 前者误杀了一半能用的节点
           #    需要在仓库 Settings → Secrets 里加一个 EDT_ADMIN = edgetunnel 后台密码
           #    没配的话脚本会自动退回 CheckSocks5，不会报错。
-          CHECK_WORKER: "https://cm.160981.xyz/admin/check?sstp=vpn:vpn@"
-          ADMIN_URL: "https://cm.160981.xyz"
+          CHECK_WORKER: "https://ip.v77580.fun/check?sstp=vpn:vpn@"
+          ADMIN_URL: "https://ip.v77580.fun"
           ADMIN_PASSWORD: ${{ secrets.EDT_ADMIN }}
           CHECK_CONCURRENCY: "16"
           CHECK_TIMEOUT: "90"
