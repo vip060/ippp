@@ -47,6 +47,15 @@ jobs:
           ADMIN_PASSWORD: ${{ secrets.EDT_ADMIN }}
           CHECK_CONCURRENCY: "16"
           CHECK_TIMEOUT: "90"
+          # ---- 第二阶段：AI 解锁实测（A 方案，2026-10-15）----
+          # UNLOCK_TARGET: chatgpt|claude|gemini|off（off=关闭第二阶段，回到只出住宅）
+          # UNLOCK_MODE: auto=优先 Worker 隧道实测，不支持则自动退回 ipinfo 信誉过滤；
+          #   worker=只用 Worker 实测（需部署补丁版 Worker）；reputation=只用 ipinfo 过滤
+          UNLOCK_TARGET: "chatgpt"
+          UNLOCK_MODE: "auto"
+          UNLOCK_CONCURRENCY: "4"
+          UNLOCK_TIMEOUT: "45"
+
 
       - name: Ensure GitHub Pages is enabled (one-time auto setup)
         run: |
