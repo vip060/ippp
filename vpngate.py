@@ -10,7 +10,8 @@ VPN Gate SSTP 住宅节点检测流水线
   3. 去重
   4. 并发调用检测 Worker（CheckSocks5）
   5. 获取并合并优选域名与优选 API (Cloudflare 入口)
-  6. 生成 public/data.json + public/index.html + public/nodes.txt（nodes.txt 仅住宅）
+  6. 第二阶段 AI 解锁实测：住宅节点经隧道实际请求 AI 检测点，只保留通过的
+  7. 生成 public/data.json + public/index.html + public/nodes.txt（nodes.txt 仅解锁通过的住宅）
 
 为什么必须用 CheckSocks5、不能用 edgetunnel 的 /admin/check：
   - edgetunnel 的 admin/* 是 Cookie 鉴权（MD5(UA+秘钥+密码)），不认
@@ -74,6 +75,20 @@ CONCURRENCY = max(1, int(_env("CHECK_CONCURRENCY", "8")))
 CHECK_TIMEOUT = float(_env("CHECK_TIMEOUT", "30"))
 CHECK_RETRIES = max(0, int(_env("CHECK_RETRIES", "2")))
 RETRY_BACKOFF_BASE = float(_env("RETRY_BACKOFF_BASE", "5"))
+
+# ---------------------------------------------------------------------------
+# 第二阶段：AI 解锁实测（A 方案）
+# 背景：VPN Gate 出口 IP 全在公开志愿者名单上，ASN 是住宅也不代表 AI 服务认。
+# 第二阶段让每个住宅节点经隧道实际请求一次 AI 检测点，只保留通过的进 nodes.txt。
+# 需要 Worker 支持 &unlock= 参数（见 worker 补丁说明）；
+# 若 Worker 未部署补丁版，UNLOCK_MODE=auto 会自动退回 reputation 模式
+# （用 ipinfo.io 查出口 IP 的 vpn/proxy/tor/relay/hosting 标记做信誉过滤）。
+# ---------------------------------------------------------------------------
+UNLOCK_TARGET = _env("UNLOCK_TARGET", "chatgpt")      # chatgpt|claude|gemini|off（off=关闭第二阶段）
+UNLOCK_MODE = _env("UNLOCK_MODE", "auto")             # auto|worker|reputation|off
+UNLOCK_CONCURRENCY = max(1, int(_env("UNLOCK_CONCURRENCY", "4")))
+UNLOCK_TIMEOUT = float(_env("UNLOCK_TIMEOUT", "45"))
+UNLOCK_RETRIES = max(0, int(_env("UNLOCK_RETRIES", "1")))
 MAX_CHECK_NODES = int(_env("MAX_CHECK_NODES", "0"))
 HTTP_TIMEOUT = int(_env("HTTP_TIMEOUT", "60"))
 PUBLIC_DIR = _env("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
@@ -597,11 +612,159 @@ def check_all(nodes):
             results.append(fut.result())
     return results
 
+# ---------------------------------------------------------------------------
+# 第二阶段：AI 解锁实测（A 方案）
+# ---------------------------------------------------------------------------
+def unlock_via_worker(node):
+    """
+    经 Worker 隧道实测 AI 解锁。返回 (passed, note, supported)：
+      passed=True/False  解锁通过/不通过（仅 supported=True 时有效）
+      passed=None         Worker 不支持 unlock 参数（未部署补丁版）
+    第二阶段带 &skip_lookup=1：跳过 iplocate 查询（第一阶段已查过出口信息），
+    只做 SSTP 建隧 + 解锁检测，减轻公共 Worker 的限流压力。
+    旧版 Worker 会忽略未知参数 → 返回无 unlock 字段 → 判为不支持。
+    """
+    url = (WORKER_CHECK_URL + quote(f"{node['host']}:{node['port']}", safe="")
+           + f"&unlock={UNLOCK_TARGET}&skip_lookup=1")
+    headers = {"User-Agent": "Mozilla/5.0 (gate-checker)"}
+    last_error = None
+    for attempt in range(UNLOCK_RETRIES + 1):
+        if attempt:
+            backoff = RETRY_BACKOFF_BASE * attempt + random.uniform(0, 1)
+            log("UNLOCK", f"重试 {node['host']}:{node['port']} 第 {attempt} 次，等待 {backoff:.1f}s（上次：{last_error}）")
+            time.sleep(backoff)
+        try:
+            r = requests.get(url, timeout=UNLOCK_TIMEOUT, headers=headers)
+            if r.status_code != 200:
+                last_error = f"HTTP {r.status_code}: {r.text[:120]}"
+                if r.status_code in (429, 502, 503, 504) and attempt < UNLOCK_RETRIES:
+                    continue
+                return (False, last_error, True)
+            try:
+                j = r.json()
+            except Exception as exc:
+                return (False, f"JSON 解析失败: {exc}", True)
+            if not j.get("success"):
+                err = j.get("error") or j.get("message") or "tunnel failed"
+                if _is_retryable(err) and attempt < UNLOCK_RETRIES:
+                    last_error = err
+                    continue
+                return (False, err, True)
+            u = j.get("unlock")
+            if u is None:
+                # Worker 响应里没有 unlock 字段 = 未部署补丁版
+                return (None, "worker-unsupported", False)
+            passed = bool(u.get("passed"))
+            note = f"{u.get('preset')}:{u.get('http_status')}:{u.get('reason')}"
+            return (passed, note, True)
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            if _is_retryable(last_error) and attempt < UNLOCK_RETRIES:
+                continue
+            return (False, last_error, True)
+    return (False, last_error or "unknown", True)
+
+
+def unlock_check_all(nodes):
+    """并发 Worker 隧道实测。返回 (unlocked_nodes, stats, worker_supported)。"""
+    def _one(n):
+        ok, note, supported = unlock_via_worker(n)
+        n["unlock_passed"] = ok
+        n["unlock_note"] = note
+        return supported
+
+    supported_flags = []
+    with ThreadPoolExecutor(max_workers=UNLOCK_CONCURRENCY) as pool:
+        futs = {pool.submit(_one, n): n for n in nodes}
+        for fut in as_completed(futs):
+            try:
+                supported_flags.append(fut.result())
+            except Exception:
+                supported_flags.append(True)
+    unlocked = [n for n in nodes if n.get("unlock_passed") is True]
+    stats = {
+        "checked": len(nodes),
+        "passed": len(unlocked),
+        "failed": sum(1 for n in nodes if n.get("unlock_passed") is False),
+        "unknown": sum(1 for n in nodes if n.get("unlock_passed") is None),
+    }
+    return unlocked, stats, any(supported_flags)
+
+
+_ipinfo_cache = {}
+
+
+def reputation_pass(ip):
+    """
+    用 ipinfo.io 查出口 IP 信誉。返回 (passed, note)：
+      passed=True/False  干净/命中 vpn|proxy|tor|relay|hosting 任一标记
+      passed=None         查询失败（限流/异常）— 不惩罚节点
+    同一出口 IP 只查一次（多节点可能同出口，省配额）。
+    """
+    if not ip:
+        return (None, "no-exit-ip")
+    if ip in _ipinfo_cache:
+        return _ipinfo_cache[ip]
+    try:
+        r = requests.get(f"https://ipinfo.io/{ip}/json", timeout=15,
+                         headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
+        if r.status_code == 429:
+            res = (None, "ipinfo-429")
+        elif r.status_code != 200:
+            res = (None, f"ipinfo-http-{r.status_code}")
+        else:
+            p = (r.json().get("privacy") or {})
+            bad = [k for k in ("vpn", "proxy", "tor", "relay", "hosting") if p.get(k)]
+            res = (False, "reputation:" + ",".join(bad)) if bad else (True, "reputation-clean")
+    except Exception as exc:
+        res = (None, f"reputation-error:{type(exc).__name__}")
+    _ipinfo_cache[ip] = res
+    return res
+
+
+def reputation_filter(nodes):
+    """
+    按出口 IP 去重后查信誉；查询失败（None）的节点保留不惩罚。
+    返回 (kept_nodes, stats)。
+    """
+    by_ip = {}
+    for n in nodes:
+        ip = (n.get("exit") or {}).get("ip")
+        by_ip.setdefault(ip, []).append(n)
+    verdict = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futs = {pool.submit(reputation_pass, ip): ip for ip in by_ip}
+        for fut in as_completed(futs):
+            ip = futs[fut]
+            try:
+                verdict[ip] = fut.result()
+            except Exception as exc:
+                verdict[ip] = (None, f"reputation-error:{type(exc).__name__}")
+    passed, failed, unknown = [], [], []
+    for ip, ns in by_ip.items():
+        ok, note = verdict[ip]
+        for n in ns:
+            n["unlock_note"] = note
+            n["unlock_passed"] = ok
+            if ok is True:
+                passed.append(n)
+            elif ok is False:
+                failed.append(n)
+            else:
+                unknown.append(n)
+    # 查询失败的不惩罚：并入保留（日志里单独标 unknown 数量）
+    kept = passed + unknown
+    stats = {"checked": len(nodes), "passed": len(kept),
+             "failed": len(failed), "unknown": len(unknown)}
+    return kept, stats
+
+
+
 
 # ---------------------------------------------------------------------------
 # 生成数据
 # ---------------------------------------------------------------------------
-def build_outputs(results, raw_count, sstp_count, source):
+def build_outputs(results, raw_count, sstp_count, source, unlocked=None, unlock_mode="off", unlock_stats=None):
     available = [r for r in results if r.get("success")]
     residential = [r for r in available if r.get("residential") == "residential"]
     countries = {}
@@ -620,6 +783,11 @@ def build_outputs(results, raw_count, sstp_count, source):
         "datacenter_est": sum(1 for n in available if n["residential"] == "datacenter"),
         "unknown_est": sum(1 for n in available if n["residential"] == "unknown"),
         "residential_nodes": len(residential),
+        "unlock_mode": unlock_mode,
+        "unlock_checked": (unlock_stats or {}).get("checked", 0),
+        "unlock_passed": len(unlocked) if unlocked is not None else 0,
+        "unlock_failed": (unlock_stats or {}).get("failed", 0),
+        "unlock_unknown": (unlock_stats or {}).get("unknown", 0),
         "retried": sum(1 for n in results if n.get("retries")),
     }
     by_country = {}
@@ -638,6 +806,8 @@ def build_outputs(results, raw_count, sstp_count, source):
         "countries": by_country,
         "available": available,
         "residential": residential,
+        "unlocked": residential if unlocked is None else unlocked,
+        "unlock_mode": unlock_mode,
     }
     return data
 
@@ -650,14 +820,16 @@ def build_nodes_text(data, edge_hosts):
     """
     if not edge_hosts:
         raise RuntimeError("没有可用的 Cloudflare 入口（EDGE_HOSTS / OPTIMAL_API 校验全部失败），不生成 nodes.txt")
-    residential = data.get("residential") or [
-        n for n in data.get("available", []) if n.get("residential") == "residential"
-    ]
-    if not residential:
+    candidates = data.get("unlocked")
+    if candidates is None:
+        candidates = data.get("residential") or [
+            n for n in data.get("available", []) if n.get("residential") == "residential"
+        ]
+    if not candidates:
         return ""
     # 按国家分组，组内住宅按延迟排序；入口轮转分配
     by_country = {}
-    for n in residential:
+    for n in candidates:
         by_country.setdefault(n.get("country") or "未知", []).append(n)
     ordered = sorted(
         by_country.items(),
@@ -751,8 +923,39 @@ def main():
     if not residential:
         die("本轮无住宅节点（成功节点全部为机房/未知，或全部检测失败）— 不覆盖旧文件，避免发布空 nodes.txt")
 
-    data = build_outputs(results, raw_count, sstp_count, source)
-    log("RESULT", f"可用节点: {len(success)}，住宅: {len(residential)}")
+    # ---- 第二阶段：AI 解锁实测 ----
+    unlock_mode = "off"
+    unlock_stats = {}
+    unlocked = residential
+    if UNLOCK_TARGET != "off" and UNLOCK_MODE != "off":
+        if UNLOCK_MODE in ("auto", "worker"):
+            log("UNLOCK", f"Worker 隧道实测解锁 target={UNLOCK_TARGET}（并发 {UNLOCK_CONCURRENCY}，超时 {UNLOCK_TIMEOUT}s）")
+            t1 = time.time()
+            unlocked, unlock_stats, worker_supported = unlock_check_all(residential)
+            log("UNLOCK", f"Worker 实测完成: 通过 {unlock_stats['passed']}/{unlock_stats['checked']}，耗时 {time.time() - t1:.1f}s")
+            if worker_supported:
+                unlock_mode = f"worker:{UNLOCK_TARGET}"
+            elif UNLOCK_MODE == "worker":
+                log("UNLOCK", "Worker 不支持 unlock 参数（未部署补丁版）— 本轮退回住宅节点，不做解锁过滤")
+                unlocked = residential
+                unlock_mode = "worker-unsupported-fallback-residential"
+            else:
+                log("UNLOCK", "Worker 不支持 unlock 参数 — 自动退回 reputation 模式（ipinfo 查出口 IP 信誉）")
+                unlocked, unlock_stats = reputation_filter(residential)
+                unlock_mode = "reputation"
+                log("UNLOCK", f"reputation 过滤: 通过 {unlock_stats['passed']}，拉黑 {unlock_stats['failed']}，未知 {unlock_stats['unknown']}")
+        else:  # reputation
+            log("UNLOCK", "reputation 模式：ipinfo 查出口 IP 信誉（vpn/proxy/tor/relay/hosting 任一命中即剔除）")
+            unlocked, unlock_stats = reputation_filter(residential)
+            unlock_mode = "reputation"
+            log("UNLOCK", f"reputation 过滤: 通过 {unlock_stats['passed']}，拉黑 {unlock_stats['failed']}，未知 {unlock_stats['unknown']}")
+
+    if not unlocked:
+        die(f"本轮无通过解锁实测的节点（模式 {unlock_mode}，住宅 {len(residential)} 个）— 不覆盖旧文件，避免发布空 nodes.txt")
+
+    data = build_outputs(results, raw_count, sstp_count, source,
+                         unlocked=unlocked, unlock_mode=unlock_mode, unlock_stats=unlock_stats)
+    log("RESULT", f"可用节点: {len(success)}，住宅: {len(residential)}，解锁通过: {len(unlocked)}（{unlock_mode}）")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
 
     # 动态拉取 API 并与静态优选域名混合
